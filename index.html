@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Where is my iPhone</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#f6f7f5; --fg:#1d2a24; --muted:#66756d; --card:#ffffffee; --accent:#0a7d5a; --line:#d9dfdb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14201b; --fg:#e8efeb; --muted:#93a39a; --card:#1c2b25ee; --accent:#4fd1a1; --line:#2c3d36; }
+  }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--fg);
+    font:15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #map { position:absolute; inset:0; }
+  .panel { position:absolute; z-index:1000; left:12px; right:12px; bottom:calc(12px + env(safe-area-inset-bottom, 0px));
+    max-width:420px; background:var(--card); border:1px solid var(--line); border-radius:12px;
+    padding:12px 14px; backdrop-filter:blur(6px); }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:2px 0; }
+  .row span:first-child { color:var(--muted); }
+  .status { display:flex; align-items:center; gap:8px; font-weight:600; margin-bottom:6px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); }
+  .dot.live { background:var(--accent); }
+  .err { color:#c0392b; margin-top:6px; }
+  button { font:inherit; color:var(--fg); background:transparent; border:1px solid var(--line);
+    border-radius:8px; padding:4px 10px; margin-top:8px; cursor:pointer; }
+  button:focus-visible { outline:2px solid var(--accent); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <div class="status"><span class="dot" id="dot"></span><span id="state">Connecting…</span></div>
+  <div class="row"><span>Last update</span><span id="when">–</span></div>
+  <div class="row"><span>Coordinates</span><span id="coords">–</span></div>
+  <div class="row"><span>Accuracy</span><span id="acc">–</span></div>
+  <div class="row"><span>Speed</span><span id="vel">–</span></div>
+  <div class="row"><span>Battery</span><span id="batt">–</span></div>
+  <div class="err" id="err" hidden></div>
+  <button id="follow">Follow: on</button>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ---- Configure these two ----
+const API_URL = 'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE'; // ends with /exec
+const TOKEN   = 'CHANGE-ME-to-a-long-random-string';       // same as Code.gs
+// -----------------------------
+const POLL_MS = 10000;       // refresh interval
+const LIVE_WITHIN_MS = 10 * 60 * 1000; // "live" if last fix is under 10 min old
+
+const map = L.map('map').setView([39.5, -98.35], 4);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+const trail = L.polyline([], { color:'#0a7d5a', weight:4, opacity:.8 }).addTo(map);
+const halo = L.circle([0,0], { radius:0, color:'#0a7d5a', weight:1, fillOpacity:.12 }).addTo(map);
+const marker = L.circleMarker([0,0], { radius:8, color:'#fff', weight:3, fillColor:'#0a7d5a', fillOpacity:1 });
+let first = true, follow = true, lastTs = 0;
+
+const $ = id => document.getElementById(id);
+$('follow').onclick = () => { follow = !follow; $('follow').textContent = 'Follow: ' + (follow ? 'on' : 'off'); };
+map.on('dragstart', () => { follow = false; $('follow').textContent = 'Follow: off'; });
+
+function ago(ms) {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return s + ' s ago';
+  if (s < 3600) return Math.round(s / 60) + ' min ago';
+  return Math.round(s / 3600) + ' h ago';
+}
+
+function render(points) {
+  if (!points.length) { $('state').textContent = 'No data yet'; return; }
+  const p = points[points.length - 1];
+  const ll = [p.lat, p.lon];
+  trail.setLatLngs(points.map(q => [q.lat, q.lon]));
+  if (!map.hasLayer(marker)) marker.addTo(map);
+  marker.setLatLng(ll);
+  halo.setLatLng(ll).setRadius(Number(p.acc) || 0);
+  if (first) { map.setView(ll, 16); first = false; }
+  else if (follow) map.panTo(ll);
+  lastTs = Number(p.ts);
+  $('coords').textContent = p.lat.toFixed(5) + ', ' + p.lon.toFixed(5);
+  $('acc').textContent = p.acc !== '' ? '±' + Math.round(p.acc) + ' m' : '–';
+  $('vel').textContent = p.vel !== '' ? Math.round(p.vel) + ' km/h' : '–';
+  $('batt').textContent = p.batt !== '' ? p.batt + '%' : '–';
+  tick();
+}
+
+function tick() {
+  if (!lastTs) return;
+  $('when').textContent = new Date(lastTs).toLocaleTimeString() + ' (' + ago(lastTs) + ')';
+  const live = Date.now() - lastTs < LIVE_WITHIN_MS;
+  $('dot').className = 'dot' + (live ? ' live' : '');
+  $('state').textContent = live ? 'Live' : 'Offline – showing last known position';
+}
+
+async function load() {
+  try {
+    const r = await fetch(API_URL + '?token=' + encodeURIComponent(TOKEN), { cache: 'no-store' });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    $('err').hidden = true;
+    render(d.points || []);
+  } catch (e) {
+    $('err').hidden = false;
+    $('err').textContent = 'Could not load data: ' + e.message;
+  }
+}
+
+load();
+setInterval(load, POLL_MS);
+setInterval(tick, 1000);
+</script>
+</body>
+</html>
