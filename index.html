@@ -22,9 +22,14 @@
   .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); }
   .dot.live { background:var(--accent); }
   .err { color:#c0392b; margin-top:6px; }
-  button { font:inherit; color:var(--fg); background:transparent; border:1px solid var(--line);
-    border-radius:8px; padding:4px 10px; margin-top:8px; cursor:pointer; }
-  button:focus-visible { outline:2px solid var(--accent); }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  button, select { font:inherit; color:var(--fg); background:transparent; border:1px solid var(--line);
+    border-radius:8px; padding:4px 10px; cursor:pointer; }
+  select option { color:#000; }
+  button:focus-visible, select:focus-visible { outline:2px solid var(--accent); }
+  .legend { height:6px; border-radius:3px; margin-top:8px;
+    background:linear-gradient(90deg, hsl(200 70% 45%), hsl(120 70% 45%)); }
+  .legend-labels { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; }
 </style>
 </head>
 <body>
@@ -36,8 +41,21 @@
   <div class="row"><span>Accuracy</span><span id="acc">–</span></div>
   <div class="row"><span>Speed</span><span id="vel">–</span></div>
   <div class="row"><span>Battery</span><span id="batt">–</span></div>
+  <div class="row"><span>Path distance</span><span id="dist">–</span></div>
+  <div class="legend"></div>
+  <div class="legend-labels"><span>older</span><span>newer</span></div>
   <div class="err" id="err" hidden></div>
-  <button id="follow">Follow: on</button>
+  <div class="controls">
+    <select id="range" aria-label="Path time range">
+      <option value="1">Last hour</option>
+      <option value="6">Last 6 hours</option>
+      <option value="24" selected>Last 24 hours</option>
+      <option value="168">Last 7 days</option>
+      <option value="0">All data</option>
+    </select>
+    <button id="fit">Fit path</button>
+    <button id="follow">Follow: on</button>
+  </div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -46,22 +64,29 @@
 const API_URL = 'https://script.google.com/macros/s/AKfycbzkejvi5UTsRg3sfITIHcz3QsXuDRLXWkmp6w7GJUU2juIdCvaQv7bEc84PNTDWulsP/exec'; // ends with /exec
 const TOKEN   = '3.1415926';       // same as Code.gs
 // -----------------------------
-const POLL_MS = 10000;       // refresh interval
-const LIVE_WITHIN_MS = 10 * 60 * 1000; // "live" if last fix is under 10 min old
+const POLL_MS = 10000;                  // refresh interval
+const LIVE_WITHIN_MS = 10 * 60 * 1000;  // "live" if last fix is under 10 min old
+const GAP_MS = 15 * 60 * 1000;          // don't connect points more than 15 min apart
+const MAX_ACC = 200;                    // ignore path points less accurate than this (m)
 
 const map = L.map('map').setView([39.5, -98.35], 4);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
 }).addTo(map);
 
-const trail = L.polyline([], { color:'#0a7d5a', weight:4, opacity:.8 }).addTo(map);
+const pathLayer = L.layerGroup().addTo(map);
 const halo = L.circle([0,0], { radius:0, color:'#0a7d5a', weight:1, fillOpacity:.12 }).addTo(map);
 const marker = L.circleMarker([0,0], { radius:8, color:'#fff', weight:3, fillColor:'#0a7d5a', fillOpacity:1 });
-let first = true, follow = true, lastTs = 0;
+let first = true, follow = true, lastTs = 0, points = [], shown = [];
 
 const $ = id => document.getElementById(id);
-$('follow').onclick = () => { follow = !follow; $('follow').textContent = 'Follow: ' + (follow ? 'on' : 'off'); };
-map.on('dragstart', () => { follow = false; $('follow').textContent = 'Follow: off'; });
+function setFollow(v) { follow = v; $('follow').textContent = 'Follow: ' + (v ? 'on' : 'off'); }
+$('follow').onclick = () => setFollow(!follow);
+map.on('dragstart', () => setFollow(false));
+$('range').onchange = drawPath;
+$('fit').onclick = () => {
+  if (shown.length > 1) { setFollow(false); map.fitBounds(L.latLngBounds(shown.map(p => [p.lat, p.lon])), { padding:[40, 40] }); }
+};
 
 function ago(ms) {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -70,13 +95,45 @@ function ago(ms) {
   return Math.round(s / 3600) + ' h ago';
 }
 
-function render(points) {
+function km(a, b) {
+  const R = 6371, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad, dLon = (b.lon - a.lon) * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// Older segments are blue, newer ones green.
+const color = t => 'hsl(' + (200 - t * 80) + ' 70% 45%)';
+
+function drawPath() {
+  pathLayer.clearLayers();
+  const hrs = Number($('range').value);
+  const cutoff = hrs ? Date.now() - hrs * 3600e3 : 0;
+  shown = points.filter(p => Number(p.ts) >= cutoff && (p.acc === '' || Number(p.acc) <= MAX_ACC));
+  let dist = 0;
+  for (let i = 1; i < shown.length; i++) {
+    const a = shown[i - 1], b = shown[i];
+    if (Number(b.ts) - Number(a.ts) > GAP_MS) continue;   // break the line across gaps
+    dist += km(a, b);
+    L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+      color: color(i / shown.length), weight: 5, opacity: .9, lineCap: 'round'
+    }).addTo(pathLayer);
+  }
+  if (shown.length) {
+    L.circleMarker([shown[0].lat, shown[0].lon], { radius:5, color:'#fff', weight:2, fillColor:'#2b6cb0', fillOpacity:1 })
+      .bindTooltip('Start of path').addTo(pathLayer);
+  }
+  $('dist').textContent = shown.length > 1 ? dist.toFixed(dist < 10 ? 2 : 1) + ' km' : '–';
+}
+
+function render(pts) {
+  points = pts;
   if (!points.length) { $('state').textContent = 'No data yet'; return; }
   const p = points[points.length - 1];
   const ll = [p.lat, p.lon];
-  trail.setLatLngs(points.map(q => [q.lat, q.lon]));
+  drawPath();
   if (!map.hasLayer(marker)) marker.addTo(map);
-  marker.setLatLng(ll);
+  marker.setLatLng(ll).bringToFront();
   halo.setLatLng(ll).setRadius(Number(p.acc) || 0);
   if (first) { map.setView(ll, 16); first = false; }
   else if (follow) map.panTo(ll);
